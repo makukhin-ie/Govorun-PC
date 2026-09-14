@@ -1,6 +1,5 @@
 numpy>=1.24
 sounddevice>=0.4.6
-sherpa-onnx>=1.10.0
 keyboard>=0.13.5
 pyperclip>=1.8.2
 punctuators>=0.0.5
@@ -8,3 +7,12 @@ pystray>=0.19.4
 Pillow>=10.0.0
 requests>=2.31
 tqdm>=4.66
+
+# Движок по умолчанию: GigaAM v3. Тянет onnxruntime и huggingface-hub,
+# веса качает с Hugging Face при первом запуске (~900 МБ на модель).
+onnx-asr[cpu,hub]>=0.12
+
+# Запасной движок: GigaAM v2. Работает без интернета, модель кладёт
+# download_models.py. Оставлен, чтобы программа запускалась даже когда
+# до Hugging Face не достучаться.
+sherpa-onnx>=1.10.0

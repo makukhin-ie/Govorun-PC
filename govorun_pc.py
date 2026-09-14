@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-Govorun PC — голосовой ввод на русском для Windows.
-Офлайн, на основе GigaAM v2 (Сбер) + sherpa-onnx.
+Govorun PC — голосовой ввод на русском для Windows. Полностью офлайн.
+
+Распознавание: GigaAM от Сбера. По умолчанию v3 через onnx-asr — она точнее
+и быстрее. Запасной вариант — v2 через sherpa-onnx: работает без интернета
+и без лишних пакетов. Модель выбирается в настройках или в config.json.
+
+Пунктуация: xlm-roberta (ONNX).
 
 Использование:
     python govorun_pc.py               # запуск с иконкой в трее
     python govorun_pc.py --device 2    # выбрать микрофон
     python govorun_pc.py --list-devices
+    python compare_engines.py --record 40   # сравнить модели на своём голосе
 
-Требования:
+Установка:
     pip install -r requirements.txt
-    python download_models.py          # один раз, ~330 МБ
+    python download_models.py          # только для запасного движка v2, ~330 МБ
+
+Веса v3 качаются сами при первом запуске (~900 МБ на модель).
 """
 
 from __future__ import annotations
@@ -82,13 +90,35 @@ NUM_THREADS = max(2, min(8, _cpu - 2))
 USE_PUNCT: bool       = True   # пишется в config.json
 CONVERT_NUMBERS: bool = True   # числительные словами → цифрами
 
+# Движок распознавания:
+#   onnx-v3   — GigaAM v3 через onnx-asr. По умолчанию: точнее и быстрее v2.
+#               Веса качаются с Hugging Face при первом запуске (~900 МБ).
+#   sherpa-v2 — GigaAM v2 через sherpa-onnx. Запасной вариант: работает
+#               без интернета и без onnx-asr, модель кладёт download_models.py
+ENGINE: str   = "onnx-v3"
+V3_MODEL: str = "gigaam-v3-ctc"
+
+# Что показываем в настройках: (подпись, движок, модель)
+ENGINE_CHOICES: list[tuple[str, str, str]] = [
+    ("GigaAM v3 CTC — рекомендуется",            "onnx-v3",   "gigaam-v3-ctc"),
+    ("GigaAM v3 RNN-T — быстрее, но теряет слова", "onnx-v3", "gigaam-v3-rnnt"),
+    ("GigaAM v2 — из комплекта, без установки",  "sherpa-v2", ""),
+]
+
+
+def engine_label(engine: str, model: str) -> str:
+    for label, eng, mdl in ENGINE_CHOICES:
+        if eng == engine and (eng == "sherpa-v2" or mdl == model):
+            return label
+    return ENGINE_CHOICES[0][0]
+
 
 # ============================================================
 # Настройки: живут между запусками
 # ============================================================
 def load_config() -> None:
     """Читает config.json. Отсутствие файла — не ошибка, просто дефолты."""
-    global HOTKEY, INPUT_DEVICE, USE_PUNCT, CONVERT_NUMBERS
+    global HOTKEY, INPUT_DEVICE, USE_PUNCT, CONVERT_NUMBERS, ENGINE, V3_MODEL
     if not CONFIG_PATH.exists():
         return
     try:
@@ -100,6 +130,8 @@ def load_config() -> None:
     HOTKEY = str(data.get("hotkey", HOTKEY)).strip().lower() or HOTKEY
     USE_PUNCT = bool(data.get("punctuation", USE_PUNCT))
     CONVERT_NUMBERS = bool(data.get("convert_numbers", CONVERT_NUMBERS))
+    ENGINE   = str(data.get("engine", ENGINE)).strip().lower() or ENGINE
+    V3_MODEL = str(data.get("v3_model", V3_MODEL)).strip() or V3_MODEL
 
     # Микрофон храним по имени: индексы съезжают при перетыкании устройств
     name = data.get("input_device_name")
@@ -133,6 +165,8 @@ def save_config() -> None:
                     "input_device_name": name,
                     "punctuation": USE_PUNCT,
                     "convert_numbers": CONVERT_NUMBERS,
+                    "engine": ENGINE,
+                    "v3_model": V3_MODEL,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -372,32 +406,90 @@ class Recorder:
 # ============================================================
 # Распознавание
 # ============================================================
-def load_recognizer() -> sherpa_onnx.OfflineRecognizer:
-    if not MODEL_PATH.exists() or not TOKENS_PATH.exists():
-        print(f"[!] Модель не найдена в {MODELS_DIR}", file=sys.stderr)
-        print("    Запустите:  python download_models.py", file=sys.stderr)
-        sys.exit(1)
-    print(f"⏳ Загружаю GigaAM ({NUM_THREADS} потоков)...")
-    rec = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
-        model=str(MODEL_PATH),
-        tokens=str(TOKENS_PATH),
-        num_threads=NUM_THREADS,
-        sample_rate=SAMPLE_RATE,
-        feature_dim=FEATURE_DIM,
-        decoding_method="greedy_search",
-    )
+class _SherpaV2:
+    """GigaAM v2 через sherpa-onnx — исходный движок Говоруна."""
+
+    name = "GigaAM v2 (sherpa-onnx)"
+
+    def __init__(self) -> None:
+        if not MODEL_PATH.exists() or not TOKENS_PATH.exists():
+            print(f"[!] Модель v2 не найдена в {MODELS_DIR}", file=sys.stderr)
+            print("    Либо скачайте её:  python download_models.py",
+                  file=sys.stderr)
+            print('    Либо поставьте v3:  pip install "onnx-asr[cpu,hub]"',
+                  file=sys.stderr)
+            sys.exit(1)
+        print(f"⏳ Загружаю {self.name}, потоков: {NUM_THREADS}...")
+        self._rec = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
+            model=str(MODEL_PATH),
+            tokens=str(TOKENS_PATH),
+            num_threads=NUM_THREADS,
+            sample_rate=SAMPLE_RATE,
+            feature_dim=FEATURE_DIM,
+            decoding_method="greedy_search",
+        )
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        stream = self._rec.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, audio)
+        self._rec.decode_stream(stream)
+        return stream.result.text.strip()
+
+
+class _OnnxV3:
+    """
+    GigaAM v3 через onnx-asr. Модель заметно точнее на русском, но требует
+    отдельной установки:  pip install "onnx-asr[cpu,hub]"
+    При первом запуске веса качаются с Hugging Face — нужен интернет один раз.
+    """
+
+    def __init__(self, model_name: str) -> None:
+        self.name = f"GigaAM v3 ({model_name}, onnx-asr)"
+        try:
+            import onnx_asr
+        except ImportError as e:
+            raise RuntimeError("пакет onnx-asr не установлен") from e
+
+        print(f"⏳ Загружаю {self.name}...")
+        print("   Первый запуск качает веса с Hugging Face (~900 МБ), это долго.")
+        try:
+            self._model = onnx_asr.load_model(model_name)
+        except Exception as e:
+            raise RuntimeError(f"{type(e).__name__}: {e}") from e
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        return str(self._model.recognize(audio, sample_rate=SAMPLE_RATE)).strip()
+
+
+def load_recognizer():
+    """
+    Собирает движок по настройке engine.
+    Если v3 недоступен — не падаем, а откатываемся на v2 из комплекта.
+    """
+    engine = (ENGINE or "sherpa-v2").strip().lower()
+
+    if engine in ("onnx-v3", "v3", "onnx"):
+        try:
+            rec = _OnnxV3(V3_MODEL)
+            print("✅ Модель готова.\n")
+            return rec
+        except Exception as e:
+            print(f"⚠️  Движок v3 недоступен: {e}")
+            print("   Работаю на GigaAM v2 из комплекта.")
+            print('   Чтобы включить v3:  pip install "onnx-asr[cpu,hub]"\n')
+    elif engine != "sherpa-v2":
+        print(f"⚠️  Неизвестный движок «{engine}», беру v2")
+
+    rec = _SherpaV2()
     print("✅ Модель готова.\n")
     return rec
 
 
-def _recognize_one(rec: sherpa_onnx.OfflineRecognizer, audio: np.ndarray) -> str:
+def _recognize_one(rec, audio: np.ndarray) -> str:
     """Распознать один кусок, который заведомо помещается в контекст модели."""
     if audio.size / SAMPLE_RATE < MIN_DURATION_SEC:
         return ""
-    stream = rec.create_stream()
-    stream.accept_waveform(SAMPLE_RATE, audio)
-    rec.decode_stream(stream)
-    return stream.result.text.strip()
+    return rec.transcribe(audio)
 
 
 def split_audio(audio: np.ndarray, sr: int = SAMPLE_RATE) -> list[np.ndarray]:
@@ -478,7 +570,7 @@ def split_audio(audio: np.ndarray, sr: int = SAMPLE_RATE) -> list[np.ndarray]:
 
 
 def recognize(
-    rec: sherpa_onnx.OfflineRecognizer,
+    rec,
     audio: np.ndarray,
     on_progress=None,
 ) -> str:
@@ -771,7 +863,7 @@ def paste_text(text: str) -> bool:
 # Контроллер: Alt+X → старт/стоп
 # ============================================================
 class Controller:
-    def __init__(self, rec: sherpa_onnx.OfflineRecognizer):
+    def __init__(self, rec):
         self.rec      = rec
         self.recorder = Recorder()
         self._busy      = False
@@ -780,6 +872,30 @@ class Controller:
         # (номер фрагмента, всего). (0, 0) — обработка закончена
         self.on_progress: callable = lambda done, total: None
         self._esc_hook = None
+
+    def reload_engine(self) -> None:
+        """
+        Меняет модель на лету. Грузится в фоне — иначе окно настроек
+        зависнет на несколько секунд. На время загрузки запись заблокирована.
+        """
+        with self._busy_lock:
+            if self._busy:
+                print("[!] Идёт обработка записи, смена модели отложена")
+                return
+            self._busy = True
+
+        def work() -> None:
+            try:
+                self.rec = load_recognizer()
+            except SystemExit:
+                print("[!] Новая модель не загрузилась, остаётся прежняя\n")
+            except Exception as e:
+                print(f"[!] Новая модель не загрузилась ({e}), остаётся прежняя\n")
+            finally:
+                with self._busy_lock:
+                    self._busy = False
+
+        threading.Thread(target=work, daemon=True).start()
 
     def toggle(self, _event=None) -> None:
         with self._busy_lock:
@@ -923,21 +1039,47 @@ class SettingsWindow:
             width=30,
         ).grid(row=1, column=1, sticky="ew", **pad)
 
-        # --- Пунктуация ---
+        # --- Модель распознавания ---
+        tk.Label(f, text="Модель:", anchor="w").grid(
+            row=2, column=0, sticky="w", **pad)
+        self._engine_labels = [c[0] for c in ENGINE_CHOICES]
+        self._engine_var = tk.StringVar(value=engine_label(ENGINE, V3_MODEL))
+        ttk.Combobox(
+            f,
+            textvariable=self._engine_var,
+            values=self._engine_labels,
+            state="readonly",
+            width=30,
+        ).grid(row=2, column=1, sticky="ew", **pad)
+
+        tk.Label(
+            f,
+            text="v3 точнее и быстрее, но требует onnx-asr\n"
+                 "и качает ~900 МБ при первом включении",
+            anchor="w", justify="left", fg="#666",
+        ).grid(row=3, columnspan=2, sticky="w", padx=10)
+
+        # --- Пунктуация и числа ---
         self._punct_var = tk.BooleanVar(value=_punct_model is not None)
         tk.Checkbutton(
             f, text="Восстанавливать пунктуацию", variable=self._punct_var
-        ).grid(row=2, columnspan=2, sticky="w", **pad)
+        ).grid(row=4, columnspan=2, sticky="w", **pad)
+
+        self._numbers_var = tk.BooleanVar(value=CONVERT_NUMBERS)
+        tk.Checkbutton(
+            f, text="Числа цифрами: «двадцать четыре» → «24»",
+            variable=self._numbers_var
+        ).grid(row=5, columnspan=2, sticky="w", **pad)
 
         # --- Словарь замен ---
         tk.Button(
             f, text="Открыть словарь замен…", width=24,
             command=self._open_replacements,
-        ).grid(row=3, columnspan=2, sticky="w", **pad)
+        ).grid(row=6, columnspan=2, sticky="w", **pad)
 
         # --- Кнопки ---
         btn_frame = tk.Frame(f)
-        btn_frame.grid(row=4, columnspan=2, pady=(8, 0))
+        btn_frame.grid(row=7, columnspan=2, pady=(8, 0))
         tk.Button(btn_frame, text="Применить", width=12,
                   command=self._apply).pack(side="left", padx=4)
         tk.Button(btn_frame, text="Отмена",    width=12,
@@ -965,14 +1107,29 @@ class SettingsWindow:
             INPUT_DEVICE = idx
             print(f"🎙  Микрофон: [{idx}] {chosen_name}")
 
-        # Пунктуация
-        global USE_PUNCT
+        # Пунктуация и числа
+        global USE_PUNCT, CONVERT_NUMBERS
         want_punct = self._punct_var.get()
         USE_PUNCT = want_punct
         if want_punct and _punct_model is None:
             load_punct_model()
         elif not want_punct:
             _punct_model = None
+
+        CONVERT_NUMBERS = self._numbers_var.get()
+
+        # Модель. Меняется редко, зато перезагрузка долгая — делаем в фоне
+        global ENGINE, V3_MODEL
+        chosen = self._engine_var.get()
+        for label, eng, mdl in ENGINE_CHOICES:
+            if label != chosen:
+                continue
+            if eng != ENGINE or (mdl and mdl != V3_MODEL):
+                ENGINE = eng
+                V3_MODEL = mdl or V3_MODEL
+                print(f"🔄 Переключаюсь на: {label}")
+                self.ctrl.reload_engine()
+            break
 
         save_config()
         print(f"💾 Настройки сохранены в {CONFIG_PATH.name}")
