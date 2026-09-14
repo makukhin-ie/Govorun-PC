@@ -79,7 +79,8 @@ REPLACEMENTS_PATH = SCRIPT_DIR / "replacements.txt"
 _cpu = os.cpu_count() or 4
 NUM_THREADS = max(2, min(8, _cpu - 2))
 
-USE_PUNCT: bool = True   # пишется в config.json
+USE_PUNCT: bool       = True   # пишется в config.json
+CONVERT_NUMBERS: bool = True   # числительные словами → цифрами
 
 
 # ============================================================
@@ -87,7 +88,7 @@ USE_PUNCT: bool = True   # пишется в config.json
 # ============================================================
 def load_config() -> None:
     """Читает config.json. Отсутствие файла — не ошибка, просто дефолты."""
-    global HOTKEY, INPUT_DEVICE, USE_PUNCT
+    global HOTKEY, INPUT_DEVICE, USE_PUNCT, CONVERT_NUMBERS
     if not CONFIG_PATH.exists():
         return
     try:
@@ -98,6 +99,7 @@ def load_config() -> None:
 
     HOTKEY = str(data.get("hotkey", HOTKEY)).strip().lower() or HOTKEY
     USE_PUNCT = bool(data.get("punctuation", USE_PUNCT))
+    CONVERT_NUMBERS = bool(data.get("convert_numbers", CONVERT_NUMBERS))
 
     # Микрофон храним по имени: индексы съезжают при перетыкании устройств
     name = data.get("input_device_name")
@@ -130,6 +132,7 @@ def save_config() -> None:
                     "hotkey": HOTKEY,
                     "input_device_name": name,
                     "punctuation": USE_PUNCT,
+                    "convert_numbers": CONVERT_NUMBERS,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -547,6 +550,182 @@ def restore_punctuation(text: str) -> str:
 
 
 # ============================================================
+# Числа словами → цифрами
+# ============================================================
+# «двадцать четыре» → «24», «пятнадцатого сентября» → «15 сентября»,
+# «в две тысячи двадцать шестом году» → «в 2026 году».
+#
+# Правило намеренно осторожное: одиночные числительные от нуля до десяти
+# остаются словами. «Один момент» не должен превращаться в «1 момент»,
+# а «во-первых» — тем более. Цифрами пишем то, что словами читается плохо:
+# составные числительные и всё, что больше десяти.
+
+_NUM_UNITS = {
+    "ноль": 0, "нуль": 0,
+    "один": 1, "одна": 1, "одно": 1, "одни": 1,
+    "два": 2, "две": 2, "три": 3, "четыре": 4, "пять": 5,
+    "шесть": 6, "семь": 7, "восемь": 8, "девять": 9,
+}
+_NUM_TEENS = {
+    "десять": 10, "одиннадцать": 11, "двенадцать": 12, "тринадцать": 13,
+    "четырнадцать": 14, "пятнадцать": 15, "шестнадцать": 16,
+    "семнадцать": 17, "восемнадцать": 18, "девятнадцать": 19,
+}
+_NUM_TENS = {
+    "двадцать": 20, "тридцать": 30, "сорок": 40, "пятьдесят": 50,
+    "шестьдесят": 60, "семьдесят": 70, "восемьдесят": 80, "девяносто": 90,
+}
+_NUM_HUNDREDS = {
+    "сто": 100, "двести": 200, "триста": 300, "четыреста": 400,
+    "пятьсот": 500, "шестьсот": 600, "семьсот": 700,
+    "восемьсот": 800, "девятьсот": 900,
+}
+_NUM_SCALES = {
+    "тысяча": 1000, "тысячи": 1000, "тысяч": 1000, "тысячу": 1000,
+    "миллион": 10**6, "миллиона": 10**6, "миллионов": 10**6,
+    "миллиард": 10**9, "миллиарда": 10**9, "миллиардов": 10**9,
+}
+
+_NUM_SIMPLE = {**_NUM_UNITS, **_NUM_TEENS, **_NUM_TENS, **_NUM_HUNDREDS}
+_NUM_ALL    = {**_NUM_SIMPLE, **_NUM_SCALES}
+
+# Порядковые: основа → значение. Окончания перебираем отдельно, чтобы
+# ловить все падежи: «пятого», «пятом», «пятый», «пятая».
+_ORD_STEMS = {
+    "перв": 1, "втор": 2, "четвёрт": 4, "четверт": 4, "пят": 5, "шест": 6,
+    "седьм": 7, "восьм": 8, "девят": 9, "десят": 10, "одиннадцат": 11,
+    "двенадцат": 12, "тринадцат": 13, "четырнадцат": 14, "пятнадцат": 15,
+    "шестнадцат": 16, "семнадцат": 17, "восемнадцат": 18, "девятнадцат": 19,
+    "двадцат": 20, "тридцат": 30, "сороков": 40, "пятидесят": 50,
+    "шестидесят": 60, "семидесят": 70, "восьмидесят": 80, "девяност": 90,
+    "сот": 100, "тысячн": 1000,
+}
+_ORD_ENDINGS = ("ый", "ой", "ий", "ого", "его", "ом", "ем", "ому", "ему",
+                "ым", "им", "ая", "яя", "ую", "юю", "ое", "ее", "ые", "ие",
+                "ых", "их", "ыми", "ими")
+
+_ORDINALS: dict[str, int] = {}
+for _stem, _val in _ORD_STEMS.items():
+    for _end in _ORD_ENDINGS:
+        _ORDINALS.setdefault(_stem + _end, _val)
+# «третий» выпадает из схемы — вписываем руками
+for _f in ("третий", "третьего", "третьем", "третья", "третьей", "третье",
+           "третьи", "третьих", "трети"):
+    _ORDINALS[_f] = 3
+
+_MONTHS = {
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+}
+_YEAR_WORDS = {"год", "года", "году", "годе", "годом"}
+
+_WORD_RE = re.compile(r"[а-яёА-ЯЁ]+")
+
+GROUP_FROM = 10_000   # с какого числа ставим разряды: 40 000, но 1500
+
+
+def _fmt(value: int) -> str:
+    if value >= GROUP_FROM:
+        return f"{value:,}".replace(",", " ")
+    return str(value)
+
+
+def _parse_run(words: list[str]) -> int | None:
+    """Считает значение цепочки числительных. None — если цепочка бессмысленная."""
+    total, current, seen = 0, 0, False
+    for w in words:
+        if w in _NUM_SCALES:
+            scale = _NUM_SCALES[w]
+            total += (current or 1) * scale
+            current = 0
+            seen = True
+        elif w in _NUM_SIMPLE:
+            current += _NUM_SIMPLE[w]
+            seen = True
+        else:
+            return None
+    return total + current if seen else None
+
+
+def convert_numbers(text: str) -> str:
+    """Заменяет числительные словами на цифры там, где это уместно."""
+    if not text:
+        return text
+
+    tokens = [(m.group(0), m.start(), m.end()) for m in _WORD_RE.finditer(text)]
+    if not tokens:
+        return text
+
+    replacements: list[tuple[int, int, str]] = []
+    i = 0
+    while i < len(tokens):
+        word, start, _ = tokens[i]
+        low = word.lower()
+
+        if low not in _NUM_ALL:
+            i += 1
+            continue
+
+        # Собираем максимальную цепочку числительных
+        j = i
+        while j + 1 < len(tokens) and tokens[j + 1][0].lower() in _NUM_ALL:
+            # Между словами должны быть только пробелы или дефис
+            between = text[tokens[j][2]:tokens[j + 1][1]]
+            if between.strip(" - "):
+                break
+            j += 1
+
+        chain = [t[0].lower() for t in tokens[i:j + 1]]
+        end   = tokens[j][2]
+        value = _parse_run(chain)
+
+        if value is None:
+            i = j + 1
+            continue
+
+        nxt      = tokens[j + 1][0].lower() if j + 1 < len(tokens) else ""
+        ordinal  = _ORDINALS.get(nxt)
+        is_scale = len(chain) == 1 and chain[0] in _NUM_SCALES
+
+        # «две тысячи двадцать шестого года» → «2026 года»
+        after_ord = tokens[j + 2][0].lower() if j + 2 < len(tokens) else ""
+        if ordinal is not None and after_ord in _YEAR_WORDS:
+            replacements.append((start, tokens[j + 1][2], _fmt(value + ordinal)))
+            i = j + 2
+            continue
+
+        # «двадцать пятого сентября» → «25 сентября»
+        if (ordinal is not None and after_ord in _MONTHS
+                and 1 <= value + ordinal <= 31):
+            replacements.append((start, tokens[j + 1][2], str(value + ordinal)))
+            i = j + 2
+            continue
+
+        if len(chain) >= 2 or (value >= 11 and not is_scale):
+            replacements.append((start, end, _fmt(value)))
+        i = j + 1
+
+    # Отдельный проход: даты вида «пятнадцатого сентября»
+    for k, (word, start, end) in enumerate(tokens):
+        low = word.lower()
+        val = _ORDINALS.get(low)
+        if val is None or not (1 <= val <= 31):
+            continue
+        nxt = tokens[k + 1][0].lower() if k + 1 < len(tokens) else ""
+        if nxt not in _MONTHS:
+            continue
+        # Составные даты вроде «двадцать пятого сентября» уже собрал
+        # основной проход — пересекающиеся замены пропускаем
+        if any(s < end and start < e for s, e, _ in replacements):
+            continue
+        replacements.append((start, end, str(val)))
+
+    for start, end, new in sorted(replacements, reverse=True):
+        text = text[:start] + new + text[end:]
+    return text
+
+
+# ============================================================
 # Вставка текста
 # ============================================================
 def save_fallback(text: str) -> Path | None:
@@ -669,6 +848,8 @@ class Controller:
         if text:
             text = restore_punctuation(text)
             text = apply_replacements(text)
+            if CONVERT_NUMBERS:
+                text = convert_numbers(text)
             # Сохраняем ДО вставки — тогда даже падение на вставке не съест текст
             save_fallback(text)
             print(f"📝 {text}")
