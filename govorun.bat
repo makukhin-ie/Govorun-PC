@@ -1,3 +1,9 @@
 @echo off
+rem Запуск с видимым окном — видно, что происходит: загрузку модели,
+rem нарезку на фрагменты, распознанный текст, ошибки.
+rem Для тихого запуска в фоне есть govorun.vbs.
+chcp 65001 >nul
 cd /d "%~dp0"
-start "" pythonw govorun_pc.py
+python govorun_pc.py
+pause
+ 

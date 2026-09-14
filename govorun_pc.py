@@ -41,6 +41,27 @@ os.environ.setdefault("HF_HOME",            str(_CACHE / "huggingface"))
 os.environ.setdefault("TRANSFORMERS_CACHE",  str(_CACHE / "huggingface" / "hub"))
 os.environ.setdefault("TORCH_HOME",          str(_CACHE / "torch"))
 
+# Вывод всегда в UTF-8.
+#
+# При тихом запуске stdout уходит в файл, и Python берёт кодировку системы —
+# на русской Windows это cp1251, в которой нет ни одного эмодзи. Любая строка
+# со значком роняла программу с UnicodeEncodeError ещё до загрузки модели,
+# причём в терминале всё работало: там консоль в UTF-8.
+#
+# errors="replace" — страховка: если поток не примет UTF-8, вместо падения
+# получим вопросительный знак.
+#
+# line_buffering нужен по той же причине. При выводе в файл Python копит
+# строки блоками по 8 КБ и сбрасывает, когда буфер полон или процесс
+# завершился. Программа живёт в трее и не завершается, поэтому лог
+# оставался пустым именно тогда, когда в него хочется заглянуть.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace",
+                            line_buffering=True)
+    except (AttributeError, ValueError, OSError):
+        pass
+
 import numpy as np
 import sounddevice as sd
 import sherpa_onnx
@@ -450,10 +471,30 @@ class _OnnxV3:
         except ImportError as e:
             raise RuntimeError("пакет onnx-asr не установлен") from e
 
+        # Спрашиваем у onnxruntime, что реально доступно, и берём лучшее.
+        # Иначе библиотека просит CUDA вслепую и на каждом старте сыплет
+        # предупреждением, что её нет.
+        providers = None
+        try:
+            import onnxruntime as ort
+
+            available = ort.get_available_providers()
+            preferred = [
+                p for p in ("CUDAExecutionProvider",      # NVIDIA
+                            "DmlExecutionProvider",       # DirectML: Intel, AMD, Qualcomm
+                            "CPUExecutionProvider")
+                if p in available
+            ]
+            providers = preferred or None
+        except Exception:
+            pass
+
         print(f"⏳ Загружаю {self.name}...")
+        if providers:
+            print(f"   Вычислитель: {providers[0].replace('ExecutionProvider', '')}")
         print("   Первый запуск качает веса с Hugging Face (~900 МБ), это долго.")
         try:
-            self._model = onnx_asr.load_model(model_name)
+            self._model = onnx_asr.load_model(model_name, providers=providers)
         except Exception as e:
             raise RuntimeError(f"{type(e).__name__}: {e}") from e
 
@@ -607,11 +648,19 @@ _punct_model = None
 def load_punct_model() -> bool:
     global _punct_model
     try:
+        import warnings
+
         from punctuators.models import PunctCapSegModelONNX
         print("⏳ Загружаю модель пунктуации (ONNX)...")
-        _punct_model = PunctCapSegModelONNX.from_pretrained(
-            "1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase"
-        )
+        # Пунктуатор просит CUDA не спрашивая и на машинах без неё сыплет
+        # предупреждением при каждом старте. Работать это не мешает —
+        # он молча уходит на процессор, — но лог замусоривает.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message=".*not in available provider names.*")
+            _punct_model = PunctCapSegModelONNX.from_pretrained(
+                "1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase"
+            )
         print("✅ Пунктуация готова.\n")
         return True
     except ImportError:
@@ -1339,6 +1388,34 @@ class TrayApp:
 
 
 # ============================================================
+# Одна копия за раз
+# ============================================================
+# При автозапуске легко получить две копии: одну поднял вход в систему,
+# вторую запустили руками. Обе вешают один и тот же хоткей с suppress,
+# и поведение становится непредсказуемым.
+#
+# Замок держим на сокете, а не на файле: если процесс убили, порт
+# освобождается сам. Файловый замок пришлось бы чистить руками.
+SINGLE_INSTANCE_PORT = 47821
+_instance_lock = None
+
+
+def ensure_single_instance() -> None:
+    global _instance_lock
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
+        sock.listen(1)
+    except OSError:
+        print("[!] Govorun уже запущен — вторая копия не нужна.", file=sys.stderr)
+        print("    Иконка в системном трее, рядом с часами.", file=sys.stderr)
+        sys.exit(1)
+    _instance_lock = sock   # держим ссылку, иначе сокет закроется
+
+
+# ============================================================
 # Утилиты
 # ============================================================
 def print_devices() -> None:
@@ -1370,6 +1447,9 @@ def main() -> None:
         print_devices()
         return
 
+    ensure_single_instance()
+
+    print(f"🕘 Старт: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print_devices()
 
     if args.device is not None:
