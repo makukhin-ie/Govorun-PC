@@ -1,0 +1,266 @@
+# ============================================================
+#  Словарь замен для Govorun
+# ============================================================
+# GigaAM обучена на русском и латиницу не выдаёт в принципе:
+# «Warhammer» у неё всегда «вархамер», «Notion» — «ноушн».
+# Здесь задаётся, как такие слова писать на самом деле.
+#
+# Формат:  что слышим = как писать
+# Пустые строки и строки с # игнорируются. Регистр слева не важен.
+# Файл перечитывается на лету — перезапускать программу не нужно.
+# Сначала применяются самые длинные фразы, потом короткие.
+#
+# На каждый термин обычно несколько строк: модель произносит одно
+# и то же слово по-разному, заранее не угадаешь. Лишние строки
+# не мешают — просто не сработают.
+#
+# Не подошло правило — удали строку. Поймал новую ошибку — допиши.
+# ============================================================
+
+
+# ---------- ИИ и ассистенты ----------
+чат джи пи ти = ChatGPT
+чат жи пи ти = ChatGPT
+чатгпт = ChatGPT
+чат гпт = ChatGPT
+джи пи ти = GPT
+опен эй ай = OpenAI
+опенэйай = OpenAI
+антропик = Anthropic
+энтропик = Anthropic
+клод = Claude
+клауд = Claude
+джемини = Gemini
+гемини = Gemini
+перплексити = Perplexity
+перплекcити = Perplexity
+копайлот = Copilot
+копилот = Copilot
+курсор = Cursor
+ноутбук эл эм = NotebookLM
+виспер = Whisper
+вispер = Whisper
+гига ам = GigaAM
+гигаам = GigaAM
+эл эл эм = LLM
+эм си пи = MCP
+
+# ---------- Рабочие инструменты ----------
+ноушн = Notion
+ноушен = Notion
+ноушион = Notion
+слак = Slack
+слэк = Slack
+тимс = Teams
+зум = Zoom
+джира = Jira
+жира = Jira
+конфлюенс = Confluence
+конфлуенс = Confluence
+миро = Miro
+фигма = Figma
+аутлук = Outlook
+ауттлук = Outlook
+эксель = Excel
+ексель = Excel
+пауэр поинт = PowerPoint
+поверпоинт = PowerPoint
+ван драйв = OneDrive
+уандрайв = OneDrive
+шер поинт = SharePoint
+шарепоинт = SharePoint
+гугл драйв = Google Drive
+гугл докс = Google Docs
+пауэр тойс = PowerToys
+пауэртойс = PowerToys
+гитхаб = GitHub
+гит хаб = GitHub
+гитхап = GitHub
+гит = git
+докер = Docker
+вс код = VS Code
+вижуал студио код = VS Code
+пайчарм = PyCharm
+обсидиан = Obsidian
+тодоист = Todoist
+трелло = Trello
+асана = Asana
+линеар = Linear
+эйртейбл = Airtable
+эн эйт эн = n8n
+запиер = Zapier
+мейк дот ком = Make
+
+# ---------- Компании и железо ----------
+майкрософт = Microsoft
+микрософт = Microsoft
+гугл = Google
+эпл = Apple
+эппл = Apple
+самсунг = Samsung
+самсунг гэлакси = Samsung Galaxy
+гэлакси = Galaxy
+интел = Intel
+интэл = Intel
+амд = AMD
+нвидиа = NVIDIA
+энвидиа = NVIDIA
+квалком = Qualcomm
+куалком = Qualcomm
+снепдрегон = Snapdragon
+снапдрагон = Snapdragon
+асус = ASUS
+леново = Lenovo
+делл = Dell
+сяоми = Xiaomi
+ксиаоми = Xiaomi
+хуавей = Huawei
+логитек = Logitech
+кейкрон = Keychron
+кичрон = Keychron
+эм эс ай = MSI
+зенбук = ZenBook
+вивобук = Vivobook
+макбук = MacBook
+айпад = iPad
+айфон = iPhone
+андроид = Android
+виндовс = Windows
+виндоус = Windows
+линукс = Linux
+убунту = Ubuntu
+макос = macOS
+
+# ---------- Работа и Agile ----------
+эйджайл = Agile
+аджайл = Agile
+скрам = Scrum
+сейф = SAFe
+спринт = sprint
+бэклог = backlog
+беклог = backlog
+роадмап = roadmap
+роудмап = roadmap
+стейкхолдер = stakeholder
+стейкхолдеры = stakeholders
+дедлайн = deadline
+деплой = deploy
+деплоймент = deployment
+релиз = release
+релиз трейн = Release Train
+пи планинг = PI Planning
+пиай планинг = PI Planning
+ретро = retro
+дейли = daily
+груминг = grooming
+эпик = epic
+сторипоинт = story point
+кей пи ай = KPI
+о кей ар = OKR
+пи эм о = PMO
+си ви = CV
+эйч ар = HR
+
+# ---------- Его контекст ----------
+синджента = Syngenta
+сингента = Syngenta
+эпам = EPAM
+sap = SAP
+эс эй пи = SAP
+хайбрис = Hybris
+гибрис = Hybris
+зискейлер = Zscaler
+зетскейлер = Zscaler
+зет пи эй = ZPA
+клауд найн = Cloud Nine
+эджайл ай тек = AGILEAI TECH
+линкедин = LinkedIn
+линкдин = LinkedIn
+регина мария = Regina Maria
+яссы = Iași
+
+# ---------- 3D-печать ----------
+прусаслайсер = PrusaSlicer
+пруса слайсер = PrusaSlicer
+пруса = Prusa
+слайсер = slicer
+бамбу лаб = Bambu Lab
+бамбулаб = Bambu Lab
+кура = Cura
+пла = PLA
+петг = PETG
+пэтэгэ = PETG
+абс = ABS
+аса = ASA
+тпу = TPU
+стл = STL
+джи код = G-code
+гкод = G-code
+филамент = filament
+
+# ---------- Умный дом ----------
+хоум ассистент = Home Assistant
+хом ассистант = Home Assistant
+зигби = Zigbee
+зигбее = Zigbee
+шелли = Shelly
+акара = Aqara
+аквара = Aqara
+твитаска = Tasmota
+есп хоум = ESPHome
+вай фай = Wi-Fi
+блютус = Bluetooth
+блютуз = Bluetooth
+
+# ---------- Игры и досуг ----------
+вархамер = Warhammer
+вархаммер = Warhammer
+вар хаммер = Warhammer
+гладиус = Gladius
+цивилизация = Civilization
+стим = Steam
+джифорс нау = GeForce Now
+дискорд = Discord
+ютуб = YouTube
+телеграм = Telegram
+нетфликс = Netflix
+спотифай = Spotify
+
+# ---------- Общая техника ----------
+питон = Python
+пайтон = Python
+джава скрипт = JavaScript
+джаваскрипт = JavaScript
+тайп скрипт = TypeScript
+реакт = React
+эйч ти эм эл = HTML
+си эс эс = CSS
+джейсон = JSON
+эй пи ай = API
+юай = UI
+юикс = UX
+бэкенд = backend
+фронтенд = frontend
+девопс = DevOps
+коммит = commit
+пул реквест = pull request
+мердж = merge
+бранч = branch
+дебаг = debug
+скрин шот = скриншот
+эйай = AI
+ай ти = IT
+пи си = PC
+ю эс би = USB
+эйч ди эм ай = HDMI
+эс эс ди = SSD
+рам = RAM
+си пи ю = CPU
+джи пи ю = GPU
+эн пи ю = NPU
+куда = CUDA
+оникс = ONNX
+пи ди эф = PDF
+си эс ви = CSV
+икс эл эс икс = XLSX
+вай пи эн = VPN
