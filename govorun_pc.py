@@ -846,10 +846,14 @@ class Controller:
         self.on_progress(0, 0)
 
         if text:
-            text = restore_punctuation(text)
-            text = apply_replacements(text)
+            # Числа — ДО пунктуации. Иначе модель пунктуации успевает
+            # вставить запятую внутрь числительного («триста, шестьдесят
+            # пять»), и оно распадается на «300, 65». Замены — после,
+            # чтобы truecase не трогал уже готовую латиницу.
             if CONVERT_NUMBERS:
                 text = convert_numbers(text)
+            text = restore_punctuation(text)
+            text = apply_replacements(text)
             # Сохраняем ДО вставки — тогда даже падение на вставке не съест текст
             save_fallback(text)
             print(f"📝 {text}")
