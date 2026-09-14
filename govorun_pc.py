@@ -41,6 +41,41 @@ os.environ.setdefault("HF_HOME",            str(_CACHE / "huggingface"))
 os.environ.setdefault("TRANSFORMERS_CACHE",  str(_CACHE / "huggingface" / "hub"))
 os.environ.setdefault("TORCH_HOME",          str(_CACHE / "torch"))
 
+
+def _hub_is_populated() -> bool:
+    """Есть ли в кэше хоть одна скачанная модель."""
+    try:
+        return any((_CACHE / "huggingface" / "hub").glob("models--*"))
+    except OSError:
+        return False
+
+
+# Если веса уже лежат в кэше — в сеть при старте не ходим вообще.
+# Иначе huggingface_hub на каждом запуске проверяет обновления: это лишняя
+# секунда, анонимное предупреждение в логе, а при автозапуске ещё и ожидание
+# таймаута, пока Wi-Fi поднимается после входа в систему.
+# Понадобится новая модель — офлайн снимется автоматически, см. _with_hub_access.
+if _hub_is_populated():
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+
+def _with_hub_access(load):
+    """Повторяет загрузку с доступом в сеть, если офлайн-кэш её не нашёл."""
+    try:
+        return load()
+    except Exception:
+        if os.environ.get("HF_HUB_OFFLINE") != "1":
+            raise
+        os.environ["HF_HUB_OFFLINE"] = "0"
+        try:
+            # Библиотека читает переменную один раз при импорте — правим и там
+            import huggingface_hub.constants as _hc
+            _hc.HF_HUB_OFFLINE = False
+        except Exception:
+            pass
+        print("   В кэше этой модели нет — качаю с Hugging Face.")
+        return load()
+
 # Вывод всегда в UTF-8.
 #
 # При тихом запуске stdout уходит в файл, и Python берёт кодировку системы —
@@ -494,7 +529,8 @@ class _OnnxV3:
             print(f"   Вычислитель: {providers[0].replace('ExecutionProvider', '')}")
         print("   Первый запуск качает веса с Hugging Face (~900 МБ), это долго.")
         try:
-            self._model = onnx_asr.load_model(model_name, providers=providers)
+            self._model = _with_hub_access(
+                lambda: onnx_asr.load_model(model_name, providers=providers))
         except Exception as e:
             raise RuntimeError(f"{type(e).__name__}: {e}") from e
 
@@ -658,9 +694,10 @@ def load_punct_model() -> bool:
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore", message=".*not in available provider names.*")
-            _punct_model = PunctCapSegModelONNX.from_pretrained(
-                "1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase"
-            )
+            _punct_model = _with_hub_access(
+                lambda: PunctCapSegModelONNX.from_pretrained(
+                    "1-800-BAD-CODE/xlm-roberta_punctuation_fullstop_truecase"
+                ))
         print("✅ Пунктуация готова.\n")
         return True
     except ImportError:
