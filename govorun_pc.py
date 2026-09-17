@@ -24,6 +24,7 @@ Govorun PC — голосовой ввод на русском для Windows. �
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -146,6 +147,14 @@ NUM_THREADS = max(2, min(8, _cpu - 2))
 USE_PUNCT: bool       = True   # пишется в config.json
 CONVERT_NUMBERS: bool = True   # числительные словами → цифрами
 
+# Через сколько минут простоя выгружать модели из памяти.
+# Программа висит в трее весь день, а веса занимают около двух гигабайт —
+# при загруженной оперативке это заметно. Загрузка обратно начинается
+# в момент нажатия хоткея, параллельно с записью, поэтому ждать
+# не приходится: пока вы говорите, модель успевает подняться.
+# 0 — никогда не выгружать (быстрее на первой фразе, дороже по памяти).
+IDLE_UNLOAD_MIN: float = 10.0
+
 # Движок распознавания:
 #   onnx-v3   — GigaAM v3 через onnx-asr. По умолчанию: точнее и быстрее v2.
 #               Веса качаются с Hugging Face при первом запуске (~900 МБ).
@@ -175,6 +184,7 @@ def engine_label(engine: str, model: str) -> str:
 def load_config() -> None:
     """Читает config.json. Отсутствие файла — не ошибка, просто дефолты."""
     global HOTKEY, INPUT_DEVICE, USE_PUNCT, CONVERT_NUMBERS, ENGINE, V3_MODEL
+    global IDLE_UNLOAD_MIN
     if not CONFIG_PATH.exists():
         return
     try:
@@ -188,6 +198,11 @@ def load_config() -> None:
     CONVERT_NUMBERS = bool(data.get("convert_numbers", CONVERT_NUMBERS))
     ENGINE   = str(data.get("engine", ENGINE)).strip().lower() or ENGINE
     V3_MODEL = str(data.get("v3_model", V3_MODEL)).strip() or V3_MODEL
+    try:
+        IDLE_UNLOAD_MIN = max(0.0, float(data.get("idle_unload_min",
+                                                  IDLE_UNLOAD_MIN)))
+    except (TypeError, ValueError):
+        pass
 
     # Микрофон храним по имени: индексы съезжают при перетыкании устройств
     name = data.get("input_device_name")
@@ -223,6 +238,7 @@ def save_config() -> None:
                     "convert_numbers": CONVERT_NUMBERS,
                     "engine": ENGINE,
                     "v3_model": V3_MODEL,
+                    "idle_unload_min": IDLE_UNLOAD_MIN,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -680,9 +696,25 @@ def recognize(
 # Пунктуация (ONNX, без PyTorch)
 # ============================================================
 _punct_model = None
+# Модель не ставится / не грузится — не пытаться снова на каждой фразе
+_punct_broken = False
+
+
+def unload_punct_model() -> None:
+    """Освобождает память под пунктуатором. Загрузится заново, когда нужен."""
+    global _punct_model
+    if _punct_model is None:
+        return
+    _punct_model = None
+    gc.collect()
+
 
 def load_punct_model() -> bool:
-    global _punct_model
+    global _punct_model, _punct_broken
+    if _punct_model is not None:
+        return True
+    if _punct_broken:
+        return False
     try:
         import warnings
 
@@ -702,15 +734,20 @@ def load_punct_model() -> bool:
         return True
     except ImportError:
         print("⚠️  punctuators не установлен — пунктуация отключена.\n")
+        _punct_broken = True
         return False
     except Exception as e:
         print(f"⚠️  Не удалось загрузить модель пунктуации: {e}\n")
+        _punct_broken = True
         return False
 
 
 def restore_punctuation(text: str) -> str:
     if not text:
         return text
+    # Модель могли выгрузить по простою — поднимаем обратно
+    if USE_PUNCT and _punct_model is None:
+        load_punct_model()
     if _punct_model is not None:
         try:
             results = _punct_model.infer([text])
@@ -954,10 +991,69 @@ class Controller:
         self.recorder = Recorder()
         self._busy      = False
         self._busy_lock = threading.Lock()
+        # Загрузка модели: чтобы две попытки не пошли параллельно
+        self._rec_lock  = threading.Lock()
+        self._last_use  = time.monotonic()
         self.on_state_change: callable = lambda recording: None  # колбэк для трея
         # (номер фрагмента, всего). (0, 0) — обработка закончена
         self.on_progress: callable = lambda done, total: None
+        # Esc нажат: распознаём, но не вставляем. Трей помечает бейдж
+        self.on_cancel_start: callable = lambda: None
+        self.on_cancel_done:  callable = lambda text: None
+        self._paste_result = True
         self._esc_hook = None
+
+    # --- жизненный цикл модели ------------------------------------------
+    def ensure_engine(self):
+        """
+        Возвращает движок, подняв его, если он был выгружен по простою.
+        Блокировка нужна потому, что вызывается из двух мест сразу:
+        из фонового прогрева при старте записи и из обработки.
+        """
+        with self._rec_lock:
+            if self.rec is None:
+                print("⏳ Поднимаю модель из кэша...")
+                self.rec = load_recognizer()
+            self._last_use = time.monotonic()
+            return self.rec
+
+    def unload_engine(self) -> bool:
+        """Выгружает модели, если сейчас ничего не происходит."""
+        with self._busy_lock:
+            if self._busy:
+                return False
+        if self.recorder.recording:
+            return False
+        with self._rec_lock:
+            if self.rec is None:
+                return False
+            self.rec = None
+        unload_punct_model()
+        gc.collect()
+        print(f"💤 Простой {IDLE_UNLOAD_MIN:.0f} мин — модели выгружены, "
+              f"память освобождена.\n")
+        return True
+
+    def start_idle_watch(self) -> None:
+        """Сторож простоя. Проверяет раз в полминуты, спит в фоне."""
+        if IDLE_UNLOAD_MIN <= 0:
+            return
+
+        def watch() -> None:
+            while True:
+                time.sleep(30)
+                if IDLE_UNLOAD_MIN <= 0:
+                    continue
+                if self.rec is None:
+                    continue
+                if time.monotonic() - self._last_use < IDLE_UNLOAD_MIN * 60:
+                    continue
+                try:
+                    self.unload_engine()
+                except Exception as e:
+                    print(f"[!] Не удалось выгрузить модель: {e}")
+
+        threading.Thread(target=watch, daemon=True).start()
 
     def reload_engine(self) -> None:
         """
@@ -972,7 +1068,9 @@ class Controller:
 
         def work() -> None:
             try:
-                self.rec = load_recognizer()
+                with self._rec_lock:
+                    self.rec = load_recognizer()
+                    self._last_use = time.monotonic()
             except SystemExit:
                 print("[!] Новая модель не загрузилась, остаётся прежняя\n")
             except Exception as e:
@@ -988,15 +1086,17 @@ class Controller:
             if self._busy:
                 return
         if self.recorder.recording:
-            self._unhook_esc()
-            with self._busy_lock:
-                self._busy = True
-            threading.Thread(target=self._process, daemon=True).start()
+            self._finish(paste=True)
         else:
             print(f"🎤 Запись... ({HOTKEY.upper()} — стоп, ESC — отмена)")
             self.recorder.start()
             self._hook_esc()
             self.on_state_change(True)
+            # Прогрев: если модель выгружена по простою, поднимаем её прямо
+            # сейчас, пока человек говорит. К моменту остановки записи она
+            # готова, и выгрузка ничего не стоит по времени.
+            if self.rec is None:
+                threading.Thread(target=self.ensure_engine, daemon=True).start()
 
     # --- отмена по Esc --------------------------------------------------
     def _hook_esc(self) -> None:
@@ -1019,15 +1119,35 @@ class Controller:
             self._esc_hook = None
 
     def _on_esc(self, _event=None) -> None:
+        """
+        Esc отменяет ВСТАВКУ, а не запись.
+
+        Раньше он выбрасывал записанное — и одно случайное нажатие стирало
+        несколько минут речи безвозвратно. Теперь запись всё равно
+        распознаётся, текст уходит в буфер и в last.txt, не происходит только
+        вставка в активное окно. Отмена в реальности почти всегда значит
+        «не сюда», а не «сотри навсегда»; а если запись и правда не нужна —
+        лежащий в файле текст ничего не стоит.
+        """
         if not self.recorder.recording:
             return
+        print("✖  Вставка отменена — текст сохраню в буфер и в last.txt")
+        self.on_cancel_start()
+        self._finish(paste=False)
+
+    def _finish(self, paste: bool) -> None:
+        """Остановить запись и отправить её в обработку."""
+        with self._busy_lock:
+            if self._busy:
+                return
+            self._busy = True
         self._unhook_esc()
-        self.recorder.cancel()
-        self.on_state_change(False)
-        self.on_progress(0, 0)
-        print("✖  Запись отменена\n")
+        self._paste_result = paste
+        threading.Thread(target=self._process, daemon=True).start()
 
     def _process(self) -> None:
+        paste = self._paste_result
+        self._paste_result = True          # следующая запись — обычная
         self.on_state_change(False)
         audio = self.recorder.stop()
         dur   = audio.size / SAMPLE_RATE
@@ -1040,7 +1160,7 @@ class Controller:
                 self.on_progress(i, total)
 
         try:
-            text = recognize(self.rec, audio, on_progress=progress)
+            text = recognize(self.ensure_engine(), audio, on_progress=progress)
         except Exception as e:
             print(f"[!] Ошибка распознавания: {e}")
             text = ""
@@ -1059,7 +1179,17 @@ class Controller:
             # Сохраняем ДО вставки — тогда даже падение на вставке не съест текст
             save_fallback(text)
             print(f"📝 {text}")
-            if paste_text(text):
+            if not paste:
+                # Вставку отменили — но текст всё равно кладём в буфер,
+                # чтобы Ctrl+V сработал там, где человек решит
+                try:
+                    pyperclip.copy(text)
+                except Exception as e:
+                    print(f"[!] Буфер обмена недоступен: {e}")
+                print(f"✖  Вставка отменена, текст в буфере — Ctrl+V куда нужно.")
+                print(f"   Копия: {FALLBACK_DIR / 'last.txt'}\n")
+                self.on_cancel_done(text)
+            elif paste_text(text):
                 print(f"✅ Вставлено за {time.monotonic() - started:.1f}с\n")
             else:
                 print("⚠️  Вставить не получилось. Текст в буфере — нажмите Ctrl+V.")
@@ -1146,7 +1276,7 @@ class SettingsWindow:
         ).grid(row=3, columnspan=2, sticky="w", padx=10)
 
         # --- Пунктуация и числа ---
-        self._punct_var = tk.BooleanVar(value=_punct_model is not None)
+        self._punct_var = tk.BooleanVar(value=USE_PUNCT)
         tk.Checkbutton(
             f, text="Восстанавливать пунктуацию", variable=self._punct_var
         ).grid(row=4, columnspan=2, sticky="w", **pad)
@@ -1197,10 +1327,10 @@ class SettingsWindow:
         global USE_PUNCT, CONVERT_NUMBERS
         want_punct = self._punct_var.get()
         USE_PUNCT = want_punct
-        if want_punct and _punct_model is None:
-            load_punct_model()
-        elif not want_punct:
-            _punct_model = None
+        if want_punct:
+            load_punct_model()      # уже загружена — вернётся сразу
+        else:
+            unload_punct_model()
 
         CONVERT_NUMBERS = self._numbers_var.get()
 
@@ -1372,8 +1502,11 @@ class TrayApp:
         self.root    = root
         self.overlay = RecordingOverlay(root)
         self._icon: pystray.Icon | None = None
+        self._cancelled = False
         ctrl.on_state_change = self._on_state_change
         ctrl.on_progress     = self._on_progress
+        ctrl.on_cancel_start = self._on_cancel_start
+        ctrl.on_cancel_done  = self._on_cancel_done
         self.overlay.level_provider = lambda: ctrl.recorder.level
 
     def _on_state_change(self, recording: bool) -> None:
@@ -1385,14 +1518,38 @@ class TrayApp:
             self.root.after(0, self.overlay.show)
         else:
             # Бейдж не прячем сразу: он превращается в индикатор обработки,
-            # чтобы не стоять и не гадать, работает оно или зависло
-            self.root.after(0, lambda: self.overlay.show("⏳ ..."))
+            # чтобы не стоять и не гадать, работает оно или зависло.
+            # После Esc — с крестиком: считается, но не вставится.
+            mark = "✖" if self._cancelled else "⏳"
+            self.root.after(0, lambda: self.overlay.show(f"{mark} ..."))
+
+    def _on_cancel_start(self) -> None:
+        """Esc нажат: бейдж продолжает считать фрагменты, но помечен крестиком."""
+        self._cancelled = True
+        self.root.after(0, lambda: self.overlay.show("✖ ..."))
+
+    def _on_cancel_done(self, text: str) -> None:
+        """Всплывающее уведомление: обработка кончилась, текст в буфере."""
+        self._cancelled = False
+        preview = text[:60] + ("…" if len(text) > 60 else "")
+        if self._icon is not None:
+            try:
+                self._icon.notify(
+                    f"Текст в буфере обмена — Ctrl+V.\n{preview}",
+                    "Вставка отменена",
+                )
+            except Exception:
+                pass    # уведомления есть не во всех окружениях, это не повод падать
 
     def _on_progress(self, done: int, total: int) -> None:
         if total <= 0:
+            self._cancelled = False
             self.root.after(0, self.overlay.hide)
         else:
-            self.root.after(0, lambda: self.overlay.set_label(f"⏳ {done}/{total}"))
+            # Крестик вместо песочных часов — видно, что считается,
+            # но вставки не будет
+            mark = "✖" if self._cancelled else "⏳"
+            self.root.after(0, lambda: self.overlay.set_label(f"{mark} {done}/{total}"))
 
     def update_tooltip(self) -> None:
         if self._icon:
@@ -1506,6 +1663,8 @@ def main() -> None:
 
     rec  = load_recognizer()
     ctrl = Controller(rec)
+
+    ctrl.start_idle_watch()
 
     keyboard.add_hotkey(HOTKEY, ctrl.toggle, suppress=True)
     print(f"🎯 [{HOTKEY.upper()}] — старт/стоп записи, [ESC] — отмена.")
