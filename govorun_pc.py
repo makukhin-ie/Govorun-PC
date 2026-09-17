@@ -1390,8 +1390,78 @@ class RecordingOverlay:
         self._blink_on = True
         self._blink_job = None
         self._level_job = None
+        # Плашка-подсказка живёт отдельно от бейджа записи
+        self._notice_win: tk.Toplevel | None = None
+        self._notice_job = None
         # Откуда брать громкость микрофона; ставится снаружи
         self.level_provider: callable = lambda: 0.0
+
+    # --- плашка-подсказка ------------------------------------------------
+    NOTICE_W, NOTICE_H = 330, 62
+
+    def notice(self, title: str, subtitle: str, ms: int = 7000) -> None:
+        """
+        Плашка в том же углу, где бейдж записи, и того же вида — только шире
+        и в две строки.
+
+        Сделана своим окном, а не уведомлением Windows: системные
+        уведомления глушит фокус-помощник и настройки приложения, они
+        оседают в центре уведомлений и до человека не доходят. Бейдж же
+        виден всегда — значит и подсказку надо показывать там же.
+
+        Держится ms миллисекунд, чтобы успеть прочитать, и убирается
+        по клику, если мешает.
+        """
+        self._close_notice()
+        W, H = self.NOTICE_W, self.NOTICE_H
+        try:
+            win = tk.Toplevel(self._root)
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            win.attributes("-alpha", 0.94)
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            win.geometry(f"{W}x{H}+{sw - W - 16}+{sh - H - 52}")
+
+            c = tk.Canvas(win, width=W, height=H, bg=self.BG, highlightthickness=0)
+            c.pack()
+            r = 10
+            c.create_arc(0, 0, 2*r, 2*r, start=90, extent=90,
+                         fill=self.BG, outline=self.BG)
+            c.create_arc(W-2*r, 0, W, 2*r, start=0, extent=90,
+                         fill=self.BG, outline=self.BG)
+            c.create_rectangle(r, 0, W-r, H, fill=self.BG, outline=self.BG)
+            c.create_rectangle(0, r, W, H-r, fill=self.BG, outline=self.BG)
+
+            c.create_oval(14, H//2 - 5, 24, H//2 + 5,
+                          fill=self.BAR_FG, outline="")
+            c.create_text(36, 20, anchor="w", text=title, fill=self.FG,
+                          font=("Segoe UI", 10, "bold"))
+            c.create_text(36, 40, anchor="w", text=subtitle, fill="#c8c8c8",
+                          font=("Segoe UI", 9))
+
+            # Клик убирает плашку, не дожидаясь таймера
+            for w in (win, c):
+                w.bind("<Button-1>", lambda _e: self._close_notice())
+
+            self._notice_win = win
+            self._notice_job = self._root.after(ms, self._close_notice)
+        except Exception as e:
+            print(f"[!] Не удалось показать подсказку: {e}")
+
+    def _close_notice(self) -> None:
+        if self._notice_job:
+            try:
+                self._root.after_cancel(self._notice_job)
+            except Exception:
+                pass
+            self._notice_job = None
+        if self._notice_win is not None:
+            try:
+                if self._notice_win.winfo_exists():
+                    self._notice_win.destroy()
+            except Exception:
+                pass
+            self._notice_win = None
 
     def set_label(self, label: str) -> None:
         """Меняет надпись на бейдже: REC во время записи, 2/5 при обработке."""
@@ -1520,26 +1590,21 @@ class TrayApp:
             # Бейдж не прячем сразу: он превращается в индикатор обработки,
             # чтобы не стоять и не гадать, работает оно или зависло.
             # После Esc — с крестиком: считается, но не вставится.
-            mark = "✖" if self._cancelled else "⏳"
+            mark = "x" if self._cancelled else "⏳"
             self.root.after(0, lambda: self.overlay.show(f"{mark} ..."))
 
     def _on_cancel_start(self) -> None:
         """Esc нажат: бейдж продолжает считать фрагменты, но помечен крестиком."""
         self._cancelled = True
-        self.root.after(0, lambda: self.overlay.show("✖ ..."))
+        self.root.after(0, lambda: self.overlay.show("x ..."))
 
     def _on_cancel_done(self, text: str) -> None:
-        """Всплывающее уведомление: обработка кончилась, текст в буфере."""
+        """Обработка кончилась: сказать, что текст не пропал, а лежит в буфере."""
         self._cancelled = False
-        preview = text[:60] + ("…" if len(text) > 60 else "")
-        if self._icon is not None:
-            try:
-                self._icon.notify(
-                    f"Текст в буфере обмена — Ctrl+V.\n{preview}",
-                    "Вставка отменена",
-                )
-            except Exception:
-                pass    # уведомления есть не во всех окружениях, это не повод падать
+        self.root.after(0, lambda: self.overlay.notice(
+            "Вставка отменена",
+            "Текст в буфере — вставьте через Ctrl+V",
+        ))
 
     def _on_progress(self, done: int, total: int) -> None:
         if total <= 0:
@@ -1548,7 +1613,7 @@ class TrayApp:
         else:
             # Крестик вместо песочных часов — видно, что считается,
             # но вставки не будет
-            mark = "✖" if self._cancelled else "⏳"
+            mark = "x" if self._cancelled else "⏳"
             self.root.after(0, lambda: self.overlay.set_label(f"{mark} {done}/{total}"))
 
     def update_tooltip(self) -> None:
