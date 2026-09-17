@@ -126,6 +126,10 @@ INPUT_DEVICE: int | None = None
 # за пределы её контекста, и качество разваливается тем сильнее, чем дальше
 # от начала записи. Поэтому режем запись по паузам на куски.
 MAX_CHUNK_SEC   = 18.0   # целевой максимум одного куска
+# Если внятной паузы к лимиту не нашлось, ищем самое тихое место в этом окне
+# перед ним. Резать ровно по лимиту нельзя: граница попадает в середину слова,
+# и слово гибнет с обеих сторон — в тексте это выглядит как «потеряет / ся».
+SEEK_QUIET_SEC  = 1.5
 MIN_CHUNK_SEC   = 1.0    # короче — приклеиваем к соседнему
 SILENCE_MIN_SEC = 0.35   # пауза такой длины считается границей фразы
 FRAME_MS        = 20     # окно анализа громкости
@@ -646,7 +650,20 @@ def split_audio(audio: np.ndarray, sr: int = SAMPLE_RATE) -> list[np.ndarray]:
             break
         # Самая поздняя пауза, которая ещё помещается в лимит
         candidates = [c for c in cuts if start + min_len < c <= limit]
-        end = candidates[-1] if candidates else limit
+        if candidates:
+            end = candidates[-1]
+        else:
+            # Внятной паузы нет — но резать ровно по лимиту нельзя, он с
+            # хорошей вероятностью придётся на середину слова. Берём самый
+            # тихий кадр в окне перед лимитом: между словами всё равно тише,
+            # чем внутри слова, даже когда человек говорит без остановки.
+            lo   = max(start + min_len, limit - int(SEEK_QUIET_SEC * sr))
+            f_lo = lo // frame
+            f_hi = min(limit // frame, n_frames)
+            end  = ((int(np.argmin(rms[f_lo:f_hi])) + f_lo) * frame
+                    if f_hi > f_lo else limit)
+            if end <= start:
+                end = limit
         chunks.append(audio[start:end])
         start = end
 
@@ -1196,6 +1213,10 @@ class Controller:
                 print(f"   Копия: {FALLBACK_DIR / 'last.txt'}\n")
         else:
             print("(тишина или слишком короткая запись)\n")
+            # Бейдж после Esc убирает именно этот колбэк — без него
+            # он остался бы висеть на экране навсегда
+            if not paste:
+                self.on_cancel_done("")
         with self._busy_lock:
             self._busy = False
 
@@ -1469,6 +1490,9 @@ class RecordingOverlay:
             self._canvas.itemconfig(self._text_id, text=label)
 
     def show(self, label: str = "● REC") -> None:
+        # Новая запись убирает плашку от прошлой отмены: две таблички
+        # в одном углу друг на друге ни о чём не говорят
+        self._close_notice()
         if self._win and self._win.winfo_exists():
             self.set_label(label)
             return
@@ -1585,6 +1609,10 @@ class TrayApp:
             self._icon.title = "🎤 Запись идёт..." if recording else f"Govorun  [{HOTKEY.upper()}]"
         # Оверлей — в главном потоке tkinter
         if recording:
+            # Страховка: флаг отмены снимается и здесь, а не только после
+            # обработки. Иначе сбой в распознавании оставил бы бейдж висеть
+            # на экране до перезапуска программы
+            self._cancelled = False
             self.root.after(0, self.overlay.show)
         else:
             # Бейдж не прячем сразу: он превращается в индикатор обработки,
@@ -1601,14 +1629,23 @@ class TrayApp:
     def _on_cancel_done(self, text: str) -> None:
         """Обработка кончилась: сказать, что текст не пропал, а лежит в буфере."""
         self._cancelled = False
-        self.root.after(0, lambda: self.overlay.notice(
-            "Вставка отменена",
-            "Текст в буфере — вставьте через Ctrl+V",
-        ))
+
+        subtitle = ("Текст в буфере — вставьте через Ctrl+V" if text
+                    else "Распознавать было нечего")
+
+        def swap() -> None:
+            self.overlay.hide()
+            self.overlay.notice("Вставка отменена", subtitle)
+
+        self.root.after(0, swap)
 
     def _on_progress(self, done: int, total: int) -> None:
         if total <= 0:
-            self._cancelled = False
+            # После Esc бейдж не убираем: через мгновение на его месте
+            # появится плашка, и мигание «пусто — плашка» только раздражает.
+            # Прячет его сам _on_cancel_done, подменяя плашкой.
+            if self._cancelled:
+                return
             self.root.after(0, self.overlay.hide)
         else:
             # Крестик вместо песочных часов — видно, что считается,
